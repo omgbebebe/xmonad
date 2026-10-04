@@ -88,7 +88,15 @@ data Svc = Svc
   , sSignals  :: Chan Signal
   , sSnapshot :: IORef (Maybe Snapshot)
   , sSurfaces :: IORef (M.Map String (Rectangle, Int32))
-    -- ^ panels' requested placements, by app_id
+    -- ^ panels' requested placements, by app_id; PERSISTENT — a
+    -- placement may arrive before the compositor has reported the
+    -- surface's window to us (pre-map), so it is retried on every
+    -- manage sequence until a window with that app_id exists
+  , sApplied  :: IORef (M.Map String Rectangle)
+    -- ^ last rectangle actually floated, per app_id (change-suppress)
+  , sStacked  :: IORef [Window]
+    -- ^ last restack order applied (change-suppress; restackWindows
+    -- forces a manage sequence, so an unconditional call would spin)
   , sGroup    :: IORef Int
   , sLayouts  :: [String]
   }
@@ -127,8 +135,10 @@ dbusService cfg = do
   sigs <- liftIO newChan
   snapRef <- liftIO (newIORef Nothing)
   surfRef <- liftIO (newIORef M.empty)
+  appliedRef <- liftIO (newIORef M.empty)
+  stackedRef <- liftIO (newIORef [])
   groupRef <- liftIO (newIORef 0)
-  let s = Svc conf sigs snapRef surfRef groupRef (dcLayouts cfg)
+  let s = Svc conf sigs snapRef surfRef appliedRef stackedRef groupRef (dcLayouts cfg)
   liftIO $ do
     void $ forkIO (dbusThread cfg s)
     -- 1s fallback emission: title and app_id changes arrive outside
@@ -139,10 +149,12 @@ dbusService cfg = do
       postAction conf (emitSignals s)
   emitter s
 
--- | The recurring emitter: diff-and-send now, re-arm for after the
--- next layout.
+-- | The recurring emitter: apply any pending surface placements (a
+-- panel's window may only now have been reported by the compositor),
+-- diff-and-send, re-arm for after the next layout.
 emitter :: Svc -> X ()
 emitter s = do
+  applySurfaces s
   emitSignals s
   afterLayout (emitter s)
 
@@ -269,23 +281,42 @@ placeSurface s appId x y w h stackOrder = do
                     , stackOrder))
   postAction (sXConf s) (applySurfaces s)
 
+-- | Apply persistent placements: float every known surface window at
+-- its requested rectangle and keep them stacked by stackOrder. Runs
+-- on every manage sequence (via the emitter) AND right after a
+-- PlaceSurface call, because either side may come first — a panel
+-- asks before its window exists, or its window appears before the
+-- panel's first placement. Everything is change-suppressed: float
+-- and restack only fire when something actually moved, so an idle
+-- loop costs two compares, not window management.
 applySurfaces :: Svc -> X ()
 applySurfaces s = do
   surfaces <- liftIO (readIORef (sSurfaces s))
   known <- liftIO . readIORef =<< asks (riverWindows . riverState)
+  floated <- gets (W.floating . windowset)
+  applied <- liftIO (readIORef (sApplied s))
   let byAppId = M.fromListWith (\a _ -> a)
         [ (a, rw) | rw <- M.elems known, Just a <- [rwAppId rw] ]
       placed =
-        [ (rw, rect, o)
+        [ (appId, rw, rect, o)
         | (appId, (rect, o)) <- M.toList surfaces
         , Just rw <- [M.lookup (BC.pack appId) byAppId]
         ]
-  forM_ placed $ \(rw, rect, _) -> do
-    moveResizeWindow (rwObject rw) rect
-    float (rwObject rw)
-  let ordered = map (\(rw, _, _) -> rwObject rw)
-        (sortBy (comparing (Down . (\(_, _, o) -> o))) placed)
-  unless (null ordered) (restackWindows ordered)
+  forM_ placed $ \(appId, rw, rect, _) -> do
+    let w = rwObject rw
+        needsFloat = M.notMember w floated
+        moved = M.lookup appId applied /= Just rect
+    when (needsFloat || moved) $ do
+      moveResizeWindow w rect
+      float w
+  liftIO $ modifyIORef' (sApplied s) $ \m ->
+    foldl (\acc (appId, _, rect, _) -> M.insert appId rect acc) m placed
+  let ordered = map (\(_, rw, _, _) -> rwObject rw)
+        (sortBy (comparing (Down . (\(_, _, _, o) -> o))) placed)
+  stacked <- liftIO (readIORef (sStacked s))
+  unless (null ordered || ordered == stacked) $ do
+    liftIO (writeIORef (sStacked s) ordered)
+    restackWindows ordered
 
 findWindowByIdent :: Svc -> String -> X (Maybe Window)
 findWindowByIdent s ident = do
