@@ -297,10 +297,19 @@ applySurfaces s = do
   applied <- liftIO (readIORef (sApplied s))
   let byAppId = M.fromListWith (\a _ -> a)
         [ (a, rw) | rw <- M.elems known, Just a <- [rwAppId rw] ]
+      -- panels identify themselves by app_id, but not every toolkit
+      -- lets a client set one per window (SDL only honors the title
+      -- at creation), so fall back to the window title — a panel's
+      -- title is its identity and does not change
+      byTitle = M.fromListWith (\a _ -> a)
+        [ (t, rw) | rw <- M.elems known, Just t <- [rwTitle rw] ]
+      lookupSurface appId = case M.lookup (BC.pack appId) byAppId of
+        Just rw -> Just rw
+        Nothing -> M.lookup (BC.pack appId) byTitle
       placed =
         [ (appId, rw, rect, o)
         | (appId, (rect, o)) <- M.toList surfaces
-        , Just rw <- [M.lookup (BC.pack appId) byAppId]
+        , Just rw <- [lookupSurface appId]
         ]
   forM_ placed $ \(appId, rw, rect, _) -> do
     let w = rwObject rw
