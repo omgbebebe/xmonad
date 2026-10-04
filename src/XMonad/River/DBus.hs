@@ -185,7 +185,10 @@ guardPanelFocus s = do
     Just w | isPanel w -> do
       lastGood <- liftIO (readIORef (sLastFocus s))
       case lastGood of
-        Just lw | Just _ <- W.findTag lw ws -> windows (W.focusWindow lw)
+        -- focusWindow on a window of ANOTHER workspace views that
+        -- workspace — only restore when it is on the current one
+        Just lw | Just t <- W.findTag lw ws, t == W.currentTag ws ->
+          windows (W.focusWindow lw)
         _ -> return ()
     foc -> liftIO (writeIORef (sLastFocus s) foc)
 
@@ -406,8 +409,17 @@ applySurfaces s = do
         , Just t <- [W.findTag (rwObject rw) wsNow]
         , t /= cur
         ]
-  unless (null stragglers) $
+  unless (null stragglers) $ do
+    -- shiftWin leaves the moved window FOCUSED; put the focus back
+    -- on what was focused before, else the focus guard will try to
+    -- restore a stale window from another workspace and focusWindow
+    -- will yank the VIEW back (the user switches, we switch back)
+    let keepFocus = W.peek wsNow
     windows (\ws -> foldl (\acc w -> W.shiftWin (W.currentTag acc) w acc) ws stragglers)
+    case keepFocus of
+      Just w | Just t <- W.findTag w wsNow, t == cur ->
+        windows (W.focusWindow w)
+      _ -> return ()
   let ordered = map (\(_, rw, _, _) -> rwObject rw)
         (sortBy (comparing (Down . (\(_, _, _, o) -> o))) placed)
   stacked <- liftIO (readIORef (sStacked s))

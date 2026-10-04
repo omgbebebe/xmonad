@@ -87,7 +87,7 @@ timeout $((DURATION + 20)) dbus-run-session -- sh -c '
   busctl --user call org.xmonad.WM /org/xmonad/WM org.xmonad.WM SwitchWorkspace s beta \
       >> "$RT/calls.log" 2>&1
   sleep 2
-  busctl --user call org.xmonad.WM /org/xmonad/WM org.xmonad.WM SwitchWorkspace s alpha \
+  busctl --user call org.xmonad.WM /org/xmonad/WM org.xmonad.WM SwitchWorkspace s gamma \
       >> "$RT/calls.log" 2>&1
   # PlaceSurface end to end, LIVE ORDERING: the placement lands while
   # the panel window does not exist yet (init.sh delays the client to
@@ -146,6 +146,18 @@ else
     report "SwitchWorkspace flipped the current workspace" no
 fi
 
+# Anti-bounce: the LAST WorkspacesChanged must name GAMMA current —
+# the second call went to gamma, so alpha-current at the end means a
+# focus-restore bug yanked the view back and re-emitted.
+LAST_WS=$(grep -n 'Member=WorkspacesChanged' "$MON" | tail -1 | cut -d: -f1)
+if [ -n "$LAST_WS" ]; then
+    if sed -n "${LAST_WS},$((LAST_WS + 45))p" "$MON" | grep -A6 'STRING "gamma"' | grep -q 'BOOLEAN true'; then
+        report "workspace switch did not bounce back" ok
+    else
+        report "workspace switch did not bounce back" no
+    fi
+fi
+
 if [ -s "$CALLS" ] && grep -qi 'error' "$CALLS"; then
     report "SwitchWorkspace calls returned cleanly" no
     head -5 "$CALLS" >&2
@@ -156,7 +168,7 @@ fi
 # the assertion that matters for panels: the titled client was
 # floated at the requested rectangle (title fallback + retry)
 if [ -n "$CLIENT" ]; then
-    if grep -q 'floated homgb-tray to (10,10) (400,40)' "$RT/wm.log" 2>/dev/null; then
+    if grep -qE 'floated homgb-tray \(object #[0-9]+\) to \(10,10\) \(400,40\)' "$RT/wm.log" 2>/dev/null; then
         report "PlaceSurface floated the panel at its rectangle" ok
     else
         report "PlaceSurface floated the panel at its rectangle" no
