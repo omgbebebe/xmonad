@@ -97,8 +97,10 @@ data Svc = Svc
 -- become signals; a signal carries the WHOLE new value (consumers
 -- diff, exactly like an EWMH property re-read).
 data Snapshot = Snapshot
-  { snapWorkspaces :: M.Map String (Bool, Bool)
-    -- ^ workspace name -> (is current, has windows)
+  { snapWorkspaces :: [(String, Bool, Bool)]
+    -- ^ (name, is current, has windows) in workspace order — an
+    -- association list, not a Map, because a panel renders the order
+    -- and "10" must not sort between "1" and "2"
   , snapWindows :: [(String, String, String, String, Bool)]
     -- ^ (identifier, title, app_id, workspace, focused); identifier is
     -- river's stable window identifier, never the recycled object id
@@ -108,7 +110,7 @@ data Snapshot = Snapshot
   } deriving (Eq, Show)
 
 data Signal
-  = SigWorkspaces (M.Map String (Bool, Bool))
+  = SigWorkspaces [(String, Bool, Bool)]
   | SigWindows [(String, String, String, String, Bool)]
   | SigFocus (String, String)
   | SigLayout (Int, [String])
@@ -170,9 +172,9 @@ takeSnapshot s = do
                , Just (rwObject rw) == focused)
              | rw <- rwList ]
       cur = W.currentTag ws
-      wsspaces = M.fromList
-        [ (W.tag wk, (W.tag wk == cur
-                     , not . null . W.integrate' $ W.stack wk))
+      wsspaces =
+        [ (W.tag wk, W.tag wk == cur
+          , not . null . W.integrate' $ W.stack wk)
         | wk <- W.workspaces ws ]
       foc = case [ rw | rw <- rwList, Just (rwObject rw) == focused ] of
         (rw:_) -> (title rw, appId rw)
