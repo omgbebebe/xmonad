@@ -205,6 +205,7 @@ takeSnapshot :: Svc -> X Snapshot
 takeSnapshot s = do
   ws <- gets windowset
   known <- liftIO . readIORef =<< asks (riverWindows . riverState)
+  conf <- asks config
   let rwList = [ rw | rw <- M.elems known, not (rwClosed rw) ]
       ident rw = fromMaybe (show (rwObject rw)) (BC.unpack <$> rwIdentifier rw)
       title rw = maybe "" BC.unpack (rwTitle rw)
@@ -215,10 +216,16 @@ takeSnapshot s = do
                , Just (rwObject rw) == focused)
              | rw <- rwList ]
       cur = W.currentTag ws
-      wsspaces =
-        [ (W.tag wk, W.tag wk == cur
-          , not . null . W.integrate' $ W.stack wk)
+      -- W.workspaces puts the CURRENT workspace first, so emitting
+      -- it in that order makes the panel reorder on every switch.
+      -- The config's list is the canonical order.
+      byTag = M.fromList
+        [ (W.tag wk, not . null . W.integrate' $ W.stack wk)
         | wk <- W.workspaces ws ]
+      wsspaces =
+        [ (name, name == cur, M.findWithDefault False name byTag)
+        | name <- XMonad.Core.workspaces conf
+        , M.member name byTag ]
       foc = case [ rw | rw <- rwList, Just (rwObject rw) == focused ] of
         (rw:_) -> (title rw, appId rw)
         []     -> ("", "")
