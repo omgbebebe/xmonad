@@ -38,7 +38,7 @@ import Control.Monad.Reader (ask, asks)
 import Control.Monad.State (gets)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int32)
-import Data.List (sortBy)
+import Data.List (sortBy, (\\))
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Ord (comparing, Down(..))
 import qualified Data.ByteString.Char8 as BC
@@ -94,11 +94,16 @@ data Svc = Svc
     -- manage sequence until a window with that app_id exists
   , sApplied  :: IORef (M.Map String Rectangle)
     -- ^ last rectangle actually floated, per app_id (change-suppress)
+  , sNoMatchWarned :: IORef [String]
+    -- ^ app_ids already logged as unmatched (warn once)
   , sStacked  :: IORef [Window]
     -- ^ last restack order applied (change-suppress; restackWindows
     -- forces a manage sequence, so an unconditional call would spin)
   , sGroup    :: IORef Int
   , sLayouts  :: [String]
+  , sLastFocus :: IORef (Maybe Window)
+    -- ^ last focused non-panel window; a clicked panel must not
+    -- keep the keyboard
   }
 
 -- | One full picture of what a bar renders.  Diffs between snapshots
@@ -137,8 +142,11 @@ dbusService cfg = do
   surfRef <- liftIO (newIORef M.empty)
   appliedRef <- liftIO (newIORef M.empty)
   stackedRef <- liftIO (newIORef [])
+  warnedRef <- liftIO (newIORef [])
   groupRef <- liftIO (newIORef 0)
-  let s = Svc conf sigs snapRef surfRef appliedRef stackedRef groupRef (dcLayouts cfg)
+  focusRef <- liftIO (newIORef Nothing)
+  let s = Svc conf sigs snapRef surfRef appliedRef stackedRef warnedRef
+            groupRef (dcLayouts cfg) focusRef
   liftIO $ do
     void $ forkIO (dbusThread cfg s)
     -- 1s fallback emission: title and app_id changes arrive outside
@@ -155,8 +163,31 @@ dbusService cfg = do
 emitter :: Svc -> X ()
 emitter s = do
   applySurfaces s
+  guardPanelFocus s
   emitSignals s
   afterLayout (emitter s)
+
+-- | Panels never hold focus: clicking one (a workspace button, a
+-- tray icon) must not leave the user typing into a bar. Runs every
+-- manage sequence; remembers the last non-panel focus and restores
+-- it when a panel ends up focused.
+guardPanelFocus :: Svc -> X ()
+guardPanelFocus s = do
+  ws <- gets windowset
+  surfaces <- liftIO (readIORef (sSurfaces s))
+  known <- liftIO . readIORef =<< asks (riverWindows . riverState)
+  let isPanel w = case M.lookup w known of
+        Just rw -> any (matches rw) (M.keys surfaces)
+        Nothing -> False
+      matches rw k = rwAppId rw == Just (BC.pack k)
+        || rwTitle rw == Just (BC.pack k)
+  case W.peek ws of
+    Just w | isPanel w -> do
+      lastGood <- liftIO (readIORef (sLastFocus s))
+      case lastGood of
+        Just lw | Just _ <- W.findTag lw ws -> windows (W.focusWindow lw)
+        _ -> return ()
+    foc -> liftIO (writeIORef (sLastFocus s) foc)
 
 forever :: IO () -> IO ()
 forever act = act >> forever act
@@ -224,7 +255,7 @@ dbusThread cfg s = handle warn $ do
     , interfaceMethods =
         [ autoMethod "SwitchWorkspace" (switchWorkspace s)
         , autoMethod "FocusWindow" (focusWindowById s)
-        , autoMethod "NextLayout" (nextLayout s)
+        , autoMethod "NextLayout" (nextLayout cfg s)
         , autoMethod "SetLayoutGroup" (setLayoutGroup cfg s)
         , autoMethod "PlaceSurface"
             (\appId x y w h o -> placeSurface s appId x y w h o)
@@ -260,14 +291,24 @@ focusWindowById s ident =
     mw <- findWindowByIdent s ident
     forM_ mw (windows . W.focusWindow)
 
-nextLayout :: Svc -> IO ()
-nextLayout s = postAction (sXConf s) (sendMessage NextLayout)
+-- | Rotate to the next keyboard layout group. This is NOT xmonad's
+-- NextLayout (that rotates the layout algorithm): panel layouts are
+-- xkb groups, applied by the config's dcSetGroup backend, and the
+-- new group is tracked here so the indicator follows it.
+nextLayout :: DBusConfig -> Svc -> IO ()
+nextLayout cfg s = do
+  g <- readIORef (sGroup s)
+  let n = length (sLayouts s)
+  when (n > 0) $ setGroup cfg s ((g + 1) `mod` n)
 
 setLayoutGroup :: DBusConfig -> Svc -> Int32 -> IO ()
-setLayoutGroup cfg s n = do
-  writeIORef (sGroup s) (fromIntegral n)
-  dcSetGroup cfg (fromIntegral n)
-  writeChan (sSignals s) (SigLayout (fromIntegral n, sLayouts s))
+setLayoutGroup cfg s n = setGroup cfg s (fromIntegral n)
+
+setGroup :: DBusConfig -> Svc -> Int -> IO ()
+setGroup cfg s g = do
+  writeIORef (sGroup s) g
+  dcSetGroup cfg g
+  writeChan (sSignals s) (SigLayout (g, sLayouts s))
 
 -- | Place (or move) a client's surface: float the window at the
 -- rectangle and keep every placed surface stacked by its stackOrder,
@@ -276,6 +317,7 @@ setLayoutGroup cfg s n = do
 placeSurface :: Svc -> String -> Int32 -> Int32 -> Int32 -> Int32 -> Int32
              -> IO ()
 placeSurface s appId x y w h stackOrder = do
+  hPutStrLn stderr ("xmonad-river: dbus: PlaceSurface " ++ appId)
   modifyIORef' (sSurfaces s)
     (M.insert appId (Rectangle x y (fromIntegral w) (fromIntegral h)
                     , stackOrder))
@@ -293,6 +335,9 @@ applySurfaces :: Svc -> X ()
 applySurfaces s = do
   surfaces <- liftIO (readIORef (sSurfaces s))
   known <- liftIO . readIORef =<< asks (riverWindows . riverState)
+  when (not (M.null surfaces)) $ liftIO $ hPutStrLn stderr
+    ("xmonad-river: dbus: applySurfaces want=" ++ show (M.keys surfaces)
+      ++ " titles=" ++ show [ t | rw <- M.elems known, Just t <- [rwTitle rw] ])
   floated <- gets (W.floating . windowset)
   applied <- liftIO (readIORef (sApplied s))
   let byAppId = M.fromListWith (\a _ -> a)
@@ -311,6 +356,18 @@ applySurfaces s = do
         | (appId, (rect, o)) <- M.toList surfaces
         , Just rw <- [lookupSurface appId]
         ]
+  case (M.keys surfaces, placed) of
+    ([], _) -> return ()
+    (want, []) -> do
+      -- warn once per app_id (a panel that exited would otherwise
+      -- log this every sequence forever)
+      warned <- liftIO (readIORef (sNoMatchWarned s))
+      let fresh = want \\ warned
+      unless (null fresh) $ do
+        liftIO $ hPutStrLn stderr
+          ("xmonad-river: dbus: no window yet for " ++ show fresh)
+        liftIO (writeIORef (sNoMatchWarned s) (warned ++ fresh))
+    _ -> return ()
   forM_ placed $ \(appId, rw, rect, _) -> do
     let w = rwObject rw
         needsFloat = M.notMember w floated
@@ -318,6 +375,10 @@ applySurfaces s = do
     when (needsFloat || moved) $ do
       moveResizeWindow w rect
       float w
+      liftIO $ hPutStrLn stderr
+        ("xmonad-river: dbus: " ++ (if needsFloat then "floated " else "moved ")
+          ++ appId ++ " to " ++ show (rect_x rect, rect_y rect)
+          ++ " " ++ show (rect_width rect, rect_height rect))
   liftIO $ modifyIORef' (sApplied s) $ \m ->
     foldl (\acc (appId, _, rect, _) -> M.insert appId rect acc) m placed
   let ordered = map (\(_, rw, _, _) -> rwObject rw)

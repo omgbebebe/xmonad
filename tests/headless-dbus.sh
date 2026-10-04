@@ -16,7 +16,7 @@ set -uo pipefail
 
 cd "$(dirname "$0")/.."
 
-DURATION=${1:-12}
+DURATION=${1:-18}
 
 if ! command -v river >/dev/null; then
     echo "headless-dbus: river is not installed; skipping" >&2
@@ -44,7 +44,7 @@ RT=$(mktemp -d /tmp/xrd.XXXXXX)
 chmod 700 "$RT"
 MON=$RT/monitor.log
 CALLS=$RT/calls.log
-trap 'rm -rf "$RT"' EXIT
+echo "KEEPDIR=$RT" > /dev/stderr
 
 # A client to open a window with, so WindowsChanged/FocusChanged have
 # content.  Any Wayland client will do.
@@ -53,11 +53,18 @@ for c in foot alacritty kitty weston-terminal; do
     command -v "$c" >/dev/null && { CLIENT=$c; break; }
 done
 
+# The client doubles as the panel: titled/app_ided homgb-tray, so the
+# PlaceSurface assertion exercises the real panel path (foot's
+# single-instance server drops --title on a second invocation, so the
+# panel must be the first and only foot).
+PANEL_CLIENT="$CLIENT"
+[ "$CLIENT" = foot ] && PANEL_CLIENT="foot --title homgb-tray --app-id homgb-tray"
+
 cat > "$RT/init.sh" <<EOF
 #!/bin/sh
-"$WM" &
-sleep 2
-${CLIENT:+$CLIENT >/dev/null 2>&1 &}
+"$WM" > "$RT/wm.log" 2>&1 &
+sleep 6
+${PANEL_CLIENT:+$PANEL_CLIENT >/dev/null 2>&1 &}
 sleep $DURATION
 EOF
 chmod +x "$RT/init.sh"
@@ -65,6 +72,7 @@ chmod +x "$RT/init.sh"
 timeout $((DURATION + 20)) dbus-run-session -- sh -c '
   RT='"$RT"'
   DURATION='"$DURATION"'
+  CLIENT='"${CLIENT:-}"'
   # unfiltered monitor from the start: the initial signal burst must
   # not race a monitor that attaches only after the name is owned
   busctl --user monitor > "$RT/monitor.log" 2>&1 &
@@ -81,7 +89,16 @@ timeout $((DURATION + 20)) dbus-run-session -- sh -c '
   sleep 2
   busctl --user call org.xmonad.WM /org/xmonad/WM org.xmonad.WM SwitchWorkspace s alpha \
       >> "$RT/calls.log" 2>&1
-  sleep 2
+  # PlaceSurface end to end, LIVE ORDERING: the placement lands while
+  # the panel window does not exist yet (init.sh delays the client to
+  # sleep 6); the float must happen on a later manage sequence once
+  # the compositor reports the window
+  if [ -n "$CLIENT" ]; then
+      busctl --user call org.xmonad.WM /org/xmonad/WM org.xmonad.WM \
+          PlaceSurface siiiii homgb-tray 10 10 400 40 1 \
+          >> "$RT/calls.log" 2>&1
+      sleep 8
+  fi
   kill "$MON_PID" "$RIVER_PID" 2>/dev/null
   wait "$RIVER_PID" 2>/dev/null
 '
@@ -134,6 +151,17 @@ if [ -s "$CALLS" ] && grep -qi 'error' "$CALLS"; then
     head -5 "$CALLS" >&2
 else
     report "SwitchWorkspace calls returned cleanly" ok
+fi
+
+# the assertion that matters for panels: the titled client was
+# floated at the requested rectangle (title fallback + retry)
+if [ -n "$CLIENT" ]; then
+    if grep -q 'floated homgb-tray to (10,10) (400,40)' "$RT/wm.log" 2>/dev/null; then
+        report "PlaceSurface floated the panel at its rectangle" ok
+    else
+        report "PlaceSurface floated the panel at its rectangle" no
+        grep 'dbus:' "$RT/wm.log" 2>/dev/null | head -5 >&2
+    fi
 fi
 
 if [ "$status" -ne 0 ]; then
