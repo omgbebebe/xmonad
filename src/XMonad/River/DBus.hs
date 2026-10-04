@@ -1,0 +1,296 @@
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+
+-- | The dbus service a panel client talks to — the Wayland replacement
+-- for EWMH root properties and client messages.
+--
+-- Under X11 a bar learned the workspace list from
+-- @_NET_DESKTOP_NAMES@, the window list from
+-- @_NET_CLIENT_LIST_STACKING@, and switched workspaces by sending
+-- @_NET_CURRENT_DESKTOP@ client messages to the root.  river offers
+-- none of that: the window manager is this process, and nothing else
+-- can see its state.  So this module is that channel: it pushes the
+-- window set as signals (after every manage sequence, plus a 1s
+-- fallback that catches title and app_id changes arriving outside
+-- sequences) and accepts commands as method calls, which are posted
+-- back into the manage sequence through 'postAction'.
+--
+-- The consumer is homgb's Wayland backend
+-- (design_docs/wayland.md there); the wire shapes below are the
+-- contract.  Start it from the config's startupHook:
+--
+-- > startupHook = dbusService defaultDBusConfig
+--
+-- Everything here is best-effort: a missing session bus disables the
+-- service with a warning, never a crash.
+module XMonad.River.DBus
+  ( DBusConfig(..)
+  , defaultDBusConfig
+  , dbusService
+  ) where
+
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
+import Control.Exception (SomeException, handle)
+import Control.Monad (forM, forM_, unless, void, when)
+import Control.Monad.IO.Class (MonadIO, liftIO)
+import Control.Monad.Reader (ask, asks)
+import Control.Monad.State (gets)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Data.Int (Int32)
+import Data.List (sortBy)
+import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Ord (comparing, Down(..))
+import qualified Data.ByteString.Char8 as BC
+import qualified Data.Map.Strict as M
+import System.IO (hPutStrLn, stderr)
+
+import qualified DBus
+import DBus (toVariant)
+import DBus.Client
+  (Client, autoMethod, connectSession, emit, export, requestName
+  , defaultInterface, interfaceMethods, interfaceName
+  , nameAllowReplacement, nameReplaceExisting)
+
+import XMonad.Core
+import XMonad.Layout (ChangeLayout(..))
+import XMonad.Operations (float, sendMessage, windows)
+import XMonad.River (afterLayout, moveResizeWindow, postAction, restackWindows)
+import XMonad.River.State (RiverState(..))
+import XMonad.River.Types (RiverWindow(..), Rectangle(..))
+import qualified XMonad.StackSet as W
+
+-- | Knobs on the service.  @dcSetGroup@ is deliberately not defaulted
+-- to anything clever: which backend applies an xkb layout group is a
+-- session policy (riverctl keyboard-layout, a patched compositor, a
+-- virtual keymap), and a silent wrong guess is worse than a log line.
+data DBusConfig = DBusConfig
+  { dcBusName :: String
+    -- ^ well-known name to own; default @org.xmonad.WM@
+  , dcLayouts :: [String]
+    -- ^ layout rotation list reported in LayoutChanged, in group
+    -- order; default empty (no layout reporting)
+  , dcSetGroup :: Int -> IO ()
+    -- ^ apply a layout group; default logs and does nothing
+  }
+
+defaultDBusConfig :: DBusConfig
+defaultDBusConfig = DBusConfig
+  { dcBusName = "org.xmonad.WM"
+  , dcLayouts = []
+  , dcSetGroup = \n -> hPutStrLn stderr
+      ("xmonad-river: dbus: SetLayoutGroup requested but no backend \
+       \configured (DBusConfig dcSetGroup); group was " ++ show n)
+  }
+
+data Svc = Svc
+  { sXConf    :: XConf
+  , sSignals  :: Chan Signal
+  , sSnapshot :: IORef (Maybe Snapshot)
+  , sSurfaces :: IORef (M.Map String (Rectangle, Int32))
+    -- ^ panels' requested placements, by app_id
+  , sGroup    :: IORef Int
+  , sLayouts  :: [String]
+  }
+
+-- | One full picture of what a bar renders.  Diffs between snapshots
+-- become signals; a signal carries the WHOLE new value (consumers
+-- diff, exactly like an EWMH property re-read).
+data Snapshot = Snapshot
+  { snapWorkspaces :: M.Map String (Bool, Bool)
+    -- ^ workspace name -> (is current, has windows)
+  , snapWindows :: [(String, String, String, String, Bool)]
+    -- ^ (identifier, title, app_id, workspace, focused); identifier is
+    -- river's stable window identifier, never the recycled object id
+  , snapFocus :: (String, String)
+    -- ^ (title, app_id) of the focused window, ("", "") when none
+  , snapLayout :: (Int, [String])
+  } deriving (Eq, Show)
+
+data Signal
+  = SigWorkspaces (M.Map String (Bool, Bool))
+  | SigWindows [(String, String, String, String, Bool)]
+  | SigFocus (String, String)
+  | SigLayout (Int, [String])
+
+-- | Own the bus name, export the interface, and stream signals.
+--
+-- Runs from the startup hook: forks the dbus threads (a client
+-- connection of their own, none of it on the event loop) and
+-- registers the snapshot emitter, which re-queues itself through
+-- 'afterLayout' after every manage sequence.
+dbusService :: DBusConfig -> X ()
+dbusService cfg = do
+  conf <- ask
+  sigs <- liftIO newChan
+  snapRef <- liftIO (newIORef Nothing)
+  surfRef <- liftIO (newIORef M.empty)
+  groupRef <- liftIO (newIORef 0)
+  let s = Svc conf sigs snapRef surfRef groupRef (dcLayouts cfg)
+  liftIO $ do
+    void $ forkIO (dbusThread cfg s)
+    -- 1s fallback emission: title and app_id changes arrive outside
+    -- manage sequences, and the afterLayout hook only fires inside
+    -- one.  Cheap: the snapshot diff suppresses no-change sends.
+    void $ forkIO $ forever $ do
+      threadDelay 1000000
+      postAction conf (emitSignals s)
+  emitter s
+
+-- | The recurring emitter: diff-and-send now, re-arm for after the
+-- next layout.
+emitter :: Svc -> X ()
+emitter s = do
+  emitSignals s
+  afterLayout (emitter s)
+
+forever :: IO () -> IO ()
+forever act = act >> forever act
+
+emitSignals :: Svc -> X ()
+emitSignals s = do
+  snap <- takeSnapshot s
+  old <- liftIO (readIORef (sSnapshot s))
+  liftIO $ writeIORef (sSnapshot s) (Just snap)
+  mapM_ (liftIO . writeChan (sSignals s)) (diffSignals old snap)
+
+-- | Build the current picture from the windowset and the accumulated
+-- compositor state.
+takeSnapshot :: Svc -> X Snapshot
+takeSnapshot s = do
+  ws <- gets windowset
+  known <- liftIO . readIORef =<< asks (riverWindows . riverState)
+  let rwList = [ rw | rw <- M.elems known, not (rwClosed rw) ]
+      ident rw = fromMaybe (show (rwObject rw)) (BC.unpack <$> rwIdentifier rw)
+      title rw = maybe "" BC.unpack (rwTitle rw)
+      appId rw = maybe "" BC.unpack (rwAppId rw)
+      workspaceOf w = fromMaybe "" (W.findTag w ws)
+      focused = W.peek ws
+      wins = [ (ident rw, title rw, appId rw, workspaceOf (rwObject rw)
+               , Just (rwObject rw) == focused)
+             | rw <- rwList ]
+      cur = W.currentTag ws
+      wsspaces = M.fromList
+        [ (W.tag wk, (W.tag wk == cur
+                     , not . null . W.integrate' $ W.stack wk))
+        | wk <- W.workspaces ws ]
+      foc = case [ rw | rw <- rwList, Just (rwObject rw) == focused ] of
+        (rw:_) -> (title rw, appId rw)
+        []     -> ("", "")
+  group <- liftIO (readIORef (sGroup s))
+  pure Snapshot
+    { snapWorkspaces = wsspaces
+    , snapWindows = wins
+    , snapFocus = foc
+    , snapLayout = (group, sLayouts s)
+    }
+
+diffSignals :: Maybe Snapshot -> Snapshot -> [Signal]
+diffSignals old new =
+  [ SigWorkspaces (snapWorkspaces new)
+    | fmap snapWorkspaces old /= Just (snapWorkspaces new) ]
+    ++
+  [ SigWindows (snapWindows new)
+    | fmap snapWindows old /= Just (snapWindows new) ]
+    ++
+  [ SigFocus (snapFocus new)
+    | fmap snapFocus old /= Just (snapFocus new) ]
+    ++
+  [ SigLayout (snapLayout new)
+    | fmap snapLayout old /= Just (snapLayout new) ]
+
+dbusThread :: DBusConfig -> Svc -> IO ()
+dbusThread cfg s = handle warn $ do
+  client <- connectSession
+  let name = fromMaybe (error "xmonad-river: dbus: invalid dcBusName")
+        (DBus.parseBusName (dcBusName cfg))
+  _ <- requestName client name [nameAllowReplacement, nameReplaceExisting]
+  export client "/org/xmonad/WM" defaultInterface
+    { interfaceName = "org.xmonad.WM"
+    , interfaceMethods =
+        [ autoMethod "SwitchWorkspace" (switchWorkspace s)
+        , autoMethod "FocusWindow" (focusWindowById s)
+        , autoMethod "NextLayout" (nextLayout s)
+        , autoMethod "SetLayoutGroup" (setLayoutGroup cfg s)
+        , autoMethod "PlaceSurface"
+            (\appId x y w h o -> placeSurface s appId x y w h o)
+        ]
+    }
+  forever $ emitSignal client =<< readChan (sSignals s)
+  where
+    warn (e :: SomeException) = hPutStrLn stderr
+      ("xmonad-river: dbus service failed: " ++ show e)
+
+emitSignal :: Client -> Signal -> IO ()
+emitSignal client sig = emit client $ case sig of
+  SigWorkspaces m -> base "WorkspacesChanged"
+    `withBody` [toVariant m]
+  SigWindows ws -> base "WindowsChanged"
+    `withBody` [toVariant ws]
+  SigFocus f -> base "FocusChanged"
+    `withBody` [toVariant f]
+  SigLayout l -> base "LayoutChanged"
+    `withBody` [toVariant (fromIntegral (fst l) :: Int32, snd l)]
+  where
+    base member = DBus.signal "/org/xmonad/WM" "org.xmonad.WM"
+      (DBus.memberName_ member)
+    withBody s body = s { DBus.signalBody = body }
+
+switchWorkspace :: Svc -> String -> IO ()
+switchWorkspace s name =
+  postAction (sXConf s) (windows (W.greedyView name))
+
+focusWindowById :: Svc -> String -> IO ()
+focusWindowById s ident =
+  postAction (sXConf s) $ do
+    mw <- findWindowByIdent s ident
+    forM_ mw (windows . W.focusWindow)
+
+nextLayout :: Svc -> IO ()
+nextLayout s = postAction (sXConf s) (sendMessage NextLayout)
+
+setLayoutGroup :: DBusConfig -> Svc -> Int32 -> IO ()
+setLayoutGroup cfg s n = do
+  writeIORef (sGroup s) (fromIntegral n)
+  dcSetGroup cfg (fromIntegral n)
+  writeChan (sSignals s) (SigLayout (fromIntegral n, sLayouts s))
+
+-- | Place (or move) a client's surface: float the window at the
+-- rectangle and keep every placed surface stacked by its stackOrder,
+-- highest on top — the standing equivalent of a raise, re-applied by
+-- the render sequence every frame.
+placeSurface :: Svc -> String -> Int32 -> Int32 -> Int32 -> Int32 -> Int32
+             -> IO ()
+placeSurface s appId x y w h stackOrder = do
+  modifyIORef' (sSurfaces s)
+    (M.insert appId (Rectangle x y (fromIntegral w) (fromIntegral h)
+                    , stackOrder))
+  postAction (sXConf s) (applySurfaces s)
+
+applySurfaces :: Svc -> X ()
+applySurfaces s = do
+  surfaces <- liftIO (readIORef (sSurfaces s))
+  known <- liftIO . readIORef =<< asks (riverWindows . riverState)
+  let byAppId = M.fromListWith (\a _ -> a)
+        [ (a, rw) | rw <- M.elems known, Just a <- [rwAppId rw] ]
+      placed =
+        [ (rw, rect, o)
+        | (appId, (rect, o)) <- M.toList surfaces
+        , Just rw <- [M.lookup (BC.pack appId) byAppId]
+        ]
+  forM_ placed $ \(rw, rect, _) -> do
+    moveResizeWindow (rwObject rw) rect
+    float (rwObject rw)
+  let ordered = map (\(rw, _, _) -> rwObject rw)
+        (sortBy (comparing (Down . (\(_, _, o) -> o))) placed)
+  unless (null ordered) (restackWindows ordered)
+
+findWindowByIdent :: Svc -> String -> X (Maybe Window)
+findWindowByIdent s ident = do
+  known <- liftIO . readIORef =<< asks (riverWindows . riverState)
+  pure $ case [ rwObject rw
+              | rw <- M.elems known
+              , Just i <- [rwIdentifier rw]
+              , BC.unpack i == ident ] of
+    (w:_) -> Just w
+    []    -> Nothing

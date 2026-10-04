@@ -101,6 +101,7 @@ library
                    XMonad.River.Client
                    XMonad.River.Connection
                    XMonad.River.Control
+                   XMonad.River.DBus
                    XMonad.River.Keyboard
                    XMonad.River.Keysym
                    XMonad.River.Keysym.Table
@@ -124,6 +125,12 @@ library
                  , deepseq
                  , network
                  , store-core
+                 -- The panel channel (XMonad.River.DBus): the Wayland
+                 -- replacement for EWMH root properties.  dbus-haskell
+                 -- runs its dispatch on threads of its own, so nothing
+                 -- here touches the event loop — method handlers come
+                 -- back through XMonad.River.postAction.
+                 , dbus
   -- The only C in the package.  Wayland attaches file descriptors as
   -- SCM_RIGHTS to the same sendmsg that carries the request bytes, which
   -- network cannot express and whose CMSG_* macros are not worth
@@ -249,13 +256,26 @@ executable river-submap-spec
   -- 'launch' with a config of its own, the way somebody's xmonad.hs does.
   -- tests/headless-submap.sh runs it inside a headless river and reads its log.
 
-executable river-prompt-spec
-  main-is:        river-prompt-spec.hs
+executable river-dbus-spec
+  main-is: river-dbus-spec.hs
   hs-source-dirs: tests
-  build-depends:  base
-                , bytestring
-                , unix
-                , xmonad
+  build-depends: base
+               , xmonad
+  default-language: Haskell2010
+  ghc-options: -Wall -threaded
+
+  -- A window manager config whose startup hook is dbusService.
+  -- tests/headless-dbus.sh runs it inside a headless river plus
+  -- dbus-run-session and asserts on the panel signals and on
+  -- SwitchWorkspace taking effect.
+
+executable river-prompt-spec
+  main-is: river-prompt-spec.hs
+  hs-source-dirs: tests
+  build-depends: base
+               , bytestring
+               , unix
+               , xmonad
   default-language: Haskell2010
   ghc-options:    -Wall -threaded
 
@@ -263,6 +283,7 @@ executable river-prompt-spec
   -- a compositor to talk to and `stack test` has none: tests/headless-prompt.sh
   -- starts a headless river and runs this inside it.  -threaded because a
   -- client is a thread and the watchdog is another.
+
 
   ghc-options:     -Wno-incomplete-patterns -Wno-incomplete-uni-patterns
   if impl(ghc > 8.8.4)
