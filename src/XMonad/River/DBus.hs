@@ -341,7 +341,11 @@ placeSurface s appId x y w h stackOrder = do
 applySurfaces :: Svc -> X ()
 applySurfaces s = do
   surfaces <- liftIO (readIORef (sSurfaces s))
-  known <- liftIO . readIORef =<< asks (riverWindows . riverState)
+  knownAll <- liftIO . readIORef =<< asks (riverWindows . riverState)
+  -- closed entries linger in the map (object ids are recycled): match
+  -- against a dead window and the float lands nowhere while the live
+  -- panel stays tiled
+  let known = M.filter (not . rwClosed) knownAll
   floated <- gets (W.floating . windowset)
   applied <- liftIO (readIORef (sApplied s))
   let byAppId = M.fromListWith (\a _ -> a)
@@ -369,7 +373,11 @@ applySurfaces s = do
       let fresh = want \\ warned
       unless (null fresh) $ do
         liftIO $ hPutStrLn stderr
-          ("xmonad-river: dbus: no window yet for " ++ show fresh)
+          ("xmonad-river: dbus: no window yet for " ++ show fresh
+            ++ "; known: "
+            ++ show [ (fmap BC.unpack (rwAppId rw), fmap BC.unpack (rwTitle rw)
+                      , rwClosed rw)
+                    | rw <- M.elems knownAll ])
         liftIO (writeIORef (sNoMatchWarned s) (warned ++ fresh))
     _ -> return ()
   forM_ placed $ \(appId, rw, rect, _) -> do
@@ -381,7 +389,8 @@ applySurfaces s = do
       float w
       liftIO $ hPutStrLn stderr
         ("xmonad-river: dbus: " ++ (if needsFloat then "floated " else "moved ")
-          ++ appId ++ " to " ++ show (rect_x rect, rect_y rect)
+          ++ appId ++ " (object " ++ show w ++ ") to "
+          ++ show (rect_x rect, rect_y rect)
           ++ " " ++ show (rect_width rect, rect_height rect))
   liftIO $ modifyIORef' (sApplied s) $ \m ->
     foldl (\acc (appId, _, rect, _) -> M.insert appId rect acc) m placed
