@@ -378,6 +378,20 @@ applySurfaces s = do
           ++ " " ++ show (rect_width rect, rect_height rect))
   liftIO $ modifyIORef' (sApplied s) $ \m ->
     foldl (\acc (appId, _, rect, _) -> M.insert appId rect acc) m placed
+  -- panels are omnipresent: river hides windows that are not on a
+  -- visible workspace, so a panel left on a background workspace
+  -- vanishes on switch (the sticky-desktop equivalent is keeping it
+  -- on the current one)
+  wsNow <- gets windowset
+  let cur = W.currentTag wsNow
+      stragglers =
+        [ rwObject rw
+        | (_, rw, _, _) <- placed
+        , Just t <- [W.findTag (rwObject rw) wsNow]
+        , t /= cur
+        ]
+  unless (null stragglers) $
+    windows (\ws -> foldl (\acc w -> W.shiftWin (W.currentTag acc) w acc) ws stragglers)
   let ordered = map (\(_, rw, _, _) -> rwObject rw)
         (sortBy (comparing (Down . (\(_, _, _, o) -> o))) placed)
   stacked <- liftIO (readIORef (sStacked s))
