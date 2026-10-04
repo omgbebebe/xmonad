@@ -335,9 +335,6 @@ applySurfaces :: Svc -> X ()
 applySurfaces s = do
   surfaces <- liftIO (readIORef (sSurfaces s))
   known <- liftIO . readIORef =<< asks (riverWindows . riverState)
-  when (not (M.null surfaces)) $ liftIO $ hPutStrLn stderr
-    ("xmonad-river: dbus: applySurfaces want=" ++ show (M.keys surfaces)
-      ++ " titles=" ++ show [ t | rw <- M.elems known, Just t <- [rwTitle rw] ])
   floated <- gets (W.floating . windowset)
   applied <- liftIO (readIORef (sApplied s))
   let byAppId = M.fromListWith (\a _ -> a)
