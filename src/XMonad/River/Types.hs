@@ -7,8 +7,10 @@
 -- Where river's version is narrower than X11's, the type says so and the
 -- haddock says why.
 module XMonad.River.Types
-  ( -- * Geometry
-    Rectangle(..)
+  ( -- * Strings
+    utf8ToString, stringToUtf8
+    -- * Geometry
+  , Rectangle(..)
   , BorderColor
   , Pixel, pixelColor
   , parseColor, parseColorMaybe
@@ -44,8 +46,21 @@ module XMonad.River.Types
 import Data.ByteString (ByteString)
 import Data.Int (Int32)
 import Data.Word (Word32)
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
+import Data.Text.Encoding.Error (lenientDecode)
 
 import XMonad.River.Wire (ObjectId)
+
+-- | Decode a Wayland-side string (window title, app_id, identifier).
+-- These are UTF-8 on the wire; ByteString.Char8's unpack is Latin-1 and
+-- mangles any non-ASCII title into mojibake before it reaches dbus.
+utf8ToString :: ByteString -> String
+utf8ToString = T.unpack . TE.decodeUtf8With lenientDecode
+
+-- | Encode a config/dbus-side String back to the UTF-8 the wire carries.
+stringToUtf8 :: String -> ByteString
+stringToUtf8 = TE.encodeUtf8 . T.pack
 
 --------------------------------------------------------------------------------
 -- Geometry

@@ -122,6 +122,7 @@ library
                    XMonad.River.Xkb
                    XMonad.River.WM
   build-depends:   bytestring
+                 , text
                  , deepseq
                  , network
                  , store-core

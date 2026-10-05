@@ -57,7 +57,7 @@ import XMonad.Layout (ChangeLayout(..))
 import XMonad.Operations (float, sendMessage, windows)
 import XMonad.River (afterLayout, moveResizeWindow, postAction, restackWindows)
 import XMonad.River.State (RiverState(..))
-import XMonad.River.Types (RiverWindow(..), Rectangle(..))
+import XMonad.River.Types (RiverWindow(..), Rectangle(..), utf8ToString, stringToUtf8)
 import qualified XMonad.StackSet as W
 
 -- | Knobs on the service.  @dcSetGroup@ is deliberately not defaulted
@@ -179,8 +179,8 @@ guardPanelFocus s = do
   let isPanel w = case M.lookup w known of
         Just rw -> any (matches rw) (M.keys surfaces)
         Nothing -> False
-      matches rw k = rwAppId rw == Just (BC.pack k)
-        || rwTitle rw == Just (BC.pack k)
+      matches rw k = rwAppId rw == Just (stringToUtf8 k)
+        || rwTitle rw == Just (stringToUtf8 k)
   case W.peek ws of
     Just w | isPanel w -> do
       lastGood <- liftIO (readIORef (sLastFocus s))
@@ -210,9 +210,9 @@ takeSnapshot s = do
   known <- liftIO . readIORef =<< asks (riverWindows . riverState)
   conf <- asks config
   let rwList = [ rw | rw <- M.elems known, not (rwClosed rw) ]
-      ident rw = fromMaybe (show (rwObject rw)) (BC.unpack <$> rwIdentifier rw)
-      title rw = maybe "" BC.unpack (rwTitle rw)
-      appId rw = maybe "" BC.unpack (rwAppId rw)
+      ident rw = fromMaybe (show (rwObject rw)) (utf8ToString <$> rwIdentifier rw)
+      title rw = maybe "" utf8ToString (rwTitle rw)
+      appId rw = maybe "" utf8ToString (rwAppId rw)
       workspaceOf w = fromMaybe "" (W.findTag w ws)
       focused = W.peek ws
       wins = [ (ident rw, title rw, appId rw, workspaceOf (rwObject rw)
@@ -359,9 +359,9 @@ applySurfaces s = do
       -- title is its identity and does not change
       byTitle = M.fromListWith (\a _ -> a)
         [ (t, rw) | rw <- M.elems known, Just t <- [rwTitle rw] ]
-      lookupSurface appId = case M.lookup (BC.pack appId) byAppId of
+      lookupSurface appId = case M.lookup (stringToUtf8 appId) byAppId of
         Just rw -> Just rw
-        Nothing -> M.lookup (BC.pack appId) byTitle
+        Nothing -> M.lookup (stringToUtf8 appId) byTitle
       placed =
         [ (appId, rw, rect, o)
         | (appId, (rect, o)) <- M.toList surfaces
@@ -378,7 +378,7 @@ applySurfaces s = do
         liftIO $ hPutStrLn stderr
           ("xmonad-river: dbus: no window yet for " ++ show fresh
             ++ "; known: "
-            ++ show [ (fmap BC.unpack (rwAppId rw), fmap BC.unpack (rwTitle rw)
+            ++ show [ (fmap utf8ToString (rwAppId rw), fmap utf8ToString (rwTitle rw)
                       , rwClosed rw)
                     | rw <- M.elems knownAll ])
         liftIO (writeIORef (sNoMatchWarned s) (warned ++ fresh))
@@ -433,6 +433,6 @@ findWindowByIdent s ident = do
   pure $ case [ rwObject rw
               | rw <- M.elems known
               , Just i <- [rwIdentifier rw]
-              , BC.unpack i == ident ] of
+              , utf8ToString i == ident ] of
     (w:_) -> Just w
     []    -> Nothing

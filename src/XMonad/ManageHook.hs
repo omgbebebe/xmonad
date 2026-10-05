@@ -106,7 +106,7 @@ askWindow = do
 -- @xdg_toplevel.set_title@ -- the same string X11 clients put in
 -- @_NET_WM_NAME@.
 title :: Query String
-title = maybe "" (maybe "" BC.unpack . rwTitle) <$> askWindow
+title = maybe "" (maybe "" utf8ToString . rwTitle) <$> askWindow
 
 -- | Return the application name; i.e., @app_id@.  River has no separate
 -- instance name, so this is the same string as 'className'.
@@ -120,7 +120,7 @@ resource = appName
 -- | Return the resource class; i.e., the string a client sets with
 -- @xdg_toplevel.set_app_id@.
 className :: Query String
-className = maybe "" (maybe "" BC.unpack . rwAppId) <$> askWindow
+className = maybe "" (maybe "" utf8ToString . rwAppId) <$> askWindow
 
 -- | Return whether the window will be a floating window or not
 willFloat :: Query Bool
