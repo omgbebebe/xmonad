@@ -42,7 +42,7 @@ import Control.Monad.Reader (asks)
 import Control.Monad.State (gets, modify)
 import Data.Bits ((.&.), (.|.))
 import Data.IORef
-import Data.List (isSuffixOf, sortOn)
+import Data.List (find, isSuffixOf, sortOn)
 import Data.Maybe (fromMaybe, isNothing)
 import Data.Monoid (All(..), appEndo)
 import Data.Int (Int32)
@@ -625,12 +625,22 @@ addWindow rt conn win = do
     -- must not see the old answer.  A manage hook covers a window that is
     -- fullscreen when it first appears; this covers one that changes later,
     -- which is every video player and every browser.
-    RiverWindowV1FullscreenRequested _ -> do
+    RiverWindowV1FullscreenRequested hint -> do
+      -- Capture the previous state first: the adjust below lands before
+      -- the queued action runs, so reading it there would always see True.
+      already <- maybe False rwFullscreen . M.lookup win <$> readIORef ref
       adjust ref win $ \w -> w { rwFullscreen = True }
-      queueAction rt $ void $ broadcastEvent (WindowFullscreenChanged win True)
+      queueAction rt $ do
+        unless already $ do
+          mout <- chooseFullscreenOutput rt win hint
+          forM_ mout $ \out -> emitOp (OpFullscreen win out)
+        void $ broadcastEvent (WindowFullscreenChanged win True)
     RiverWindowV1ExitFullscreenRequested -> do
+      was <- maybe False rwFullscreen . M.lookup win <$> readIORef ref
       adjust ref win $ \w -> w { rwFullscreen = False }
-      queueAction rt $ void $ broadcastEvent (WindowFullscreenChanged win False)
+      queueAction rt $ do
+        when was $ emitOp (OpExitFullscreen win)
+        void $ broadcastEvent (WindowFullscreenChanged win False)
     RiverWindowV1PointerMoveRequested _ -> pure ()
     _ -> pure ()
 
@@ -924,6 +934,31 @@ nominateLayerOutput rt = forM_ (rtLayerShell rt) $ \_ -> do
   -- that is about what has been sent rather than about what was chosen.
   io $ modifyIORef' (rtPlan rt) $ \p ->
     p { planLayerDefault = (\o -> (roObject o, roLayerObject o)) <$> chosen }
+
+-- | Choose the output to fullscreen a window on: the request's hint when it
+-- names a live output, otherwise the output backing the screen the window
+-- is on (falling back to the current screen, which covers the request that
+-- arrives before the manage sequence that first maps the window). Screens
+-- are matched to outputs by position, as in 'nominateLayerOutput'.
+chooseFullscreenOutput :: Runtime -> Window -> ObjectId -> X (Maybe ObjectId)
+chooseFullscreenOutput rt win hint = do
+  outsRef <- asks (riverOutputs . riverState)
+  outs <- io (readIORef outsRef)
+  let live = filter (not . roRemoved) (M.elems outs)
+  if not (isNullObject hint) && any ((== hint) . roObject) live
+    then return (Just hint)
+    else do
+      ws <- gets windowset
+      let screens = W.current ws : W.visible ws
+          mScreen = do
+            tag <- W.findTag win ws
+            find ((== tag) . W.tag . W.workspace) screens
+          SD d = W.screenDetail (fromMaybe (W.current ws) mScreen)
+          onScreen o = let (x, y) = roPosition o
+                       in x == rect_x d && y == rect_y d
+      return $ case filter onScreen live of
+        (o:_) -> Just (roObject o)
+        []    -> Nothing
 
 -- | Reconcile the 'WindowSet'\'s screens with river's outputs.
 --
@@ -1327,6 +1362,12 @@ transmitManage rt conn = do
   ops <- takeOps
   forM_ ops $ \case
     OpClose w -> when (M.member w known) $ riverWindowV1Close conn w
+    OpFullscreen w out -> when (M.member w known) $ do
+      riverWindowV1Fullscreen conn w out
+      riverWindowV1InformFullscreen conn w
+    OpExitFullscreen w -> when (M.member w known) $ do
+      riverWindowV1ExitFullscreen conn w
+      riverWindowV1InformNotFullscreen conn w
     OpWarpPointer s x y -> when (M.member s seats) $ riverSeatV1PointerWarp conn s x y
     OpPointerOpStart s -> when (M.member s seats) $ riverSeatV1OpStartPointer conn s
     OpUseDecorations w ssd -> when (M.member w known) $

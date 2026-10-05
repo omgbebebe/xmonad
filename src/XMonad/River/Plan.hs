@@ -109,6 +109,13 @@ data Op
     -- ^ Likewise from an interactive resize.
   | OpExitSession
     -- ^ End the Wayland session.
+  | OpFullscreen !Window !ObjectId
+    -- ^ @river_window_v1.fullscreen@ on the given output, followed by
+    -- @inform_fullscreen@. Honors a client's fullscreen request; the
+    -- compositor takes over the window's geometry while fullscreen.
+  | OpExitFullscreen !Window
+    -- ^ @river_window_v1.exit_fullscreen@ followed by
+    -- @inform_not_fullscreen@, returning the window to layout control.
   | OpStop
     -- ^ @river_window_manager_v1.stop@: ask river to release this window
     -- manager so a successor may connect.
