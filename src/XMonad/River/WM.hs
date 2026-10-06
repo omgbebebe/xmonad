@@ -46,6 +46,7 @@ import Data.List (find, isSuffixOf, sortOn)
 import Data.Maybe (fromMaybe, isNothing)
 import Data.Monoid (All(..), appEndo)
 import Data.Int (Int32)
+import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import Data.Word (Word32)
 import Control.Concurrent (Chan, MVar, forkIO, killThread, newChan, newEmptyMVar, putMVar, readChan, takeMVar, threadDelay, tryPutMVar, writeChan)
 import Control.Exception (SomeException, catch, handle)
@@ -73,7 +74,7 @@ import XMonad.River.Protocol.XkbBindings
 import XMonad.River.Wire (ObjectId, isNullObject)
 import XMonad.River.Types
 import XMonad.River.Plan
-import XMonad.River.State (InputCapture(..), RiverState(..))
+import XMonad.River.State (InputCapture(..), RiverState(..), riverDebugLine)
 import qualified XMonad.StackSet as W
 
 --------------------------------------------------------------------------------
@@ -153,6 +154,10 @@ data Runtime = Runtime
     -- ^ The output most recently nominated as the default for layer surfaces
     -- that do not name one. Held so the request is only reissued when the
     -- choice actually changes.
+  , rtDebug :: !Bool
+    -- ^ The XMONAD_RIVER_DEBUG env var, read once at startup; see
+    -- 'XMonad.River.State.riverDebugLine'. The Runtime copy serves
+    -- the event loop, which has no 'XConf'.
   }
 
 --------------------------------------------------------------------------------
@@ -214,6 +219,7 @@ run conn manager bindings bindingsVer layerShell compositor shm userConfig dirs 
   restartRef <- newIORef Nothing
   dragOrigin <- newIORef (0, 0)
   mailbox    <- MB.newMailbox
+  debug      <- maybe False (const True) <$> lookupEnv "XMONAD_RIVER_DEBUG"
   -- One IORef each, shared between the XConf and the Runtime: the event loop's
   -- callbacks reach them from IO, and a submap reaches them from X.
   bindingsRef <- newIORef M.empty
@@ -246,6 +252,7 @@ run conn manager bindings bindingsVer layerShell compositor shm userConfig dirs 
           <*> newIORef False
           <*> pure layerShell
           <*> newIORef Nothing
+          <*> pure debug
 
   when (null (workspaces userConfig)) $ hPutStrLn stderr
     "xmonad-river: the config has no workspaces; using a single one named \"1\""
@@ -293,6 +300,7 @@ run conn manager bindings bindingsVer layerShell compositor shm userConfig dirs 
             , riverCapture = submapRef
             , riverDragOrigin = dragOrigin
             , riverAfterLayout = afterLayoutRef
+            , riverDebug = debug
             }
         , normalBorder = parseColor (normalBorderColor userConfig)
         , focusedBorder = parseColor (focusedBorderColor userConfig)
@@ -404,6 +412,7 @@ run conn manager bindings bindingsVer layerShell compositor shm userConfig dirs 
         flush conn
         sockFd <- connectionFd conn
         ready <- MB.waitEither sockFd (MB.mailboxFd mailbox)
+        dbg rt ("wake " ++ either (\() -> "sock") (\() -> "mailbox") ready)
         case ready of
           Left () -> dispatch conn
           Right () -> do
@@ -580,6 +589,12 @@ broadcastEvent ev = do
 --------------------------------------------------------------------------------
 -- Object tracking
 
+-- | 'riverDebugLine' for code holding the 'Runtime' instead of the
+-- XConf (the event loop, the protocol listeners). See
+-- 'XMonad.River.State.riverDebugLine' for what the flag is.
+dbg :: Runtime -> String -> IO ()
+dbg rt = riverDebugLine (rtDebug rt)
+
 -- | Take note of a window river has just told us about.
 --
 -- Runs on the event loop, in 'IO', and touches no 'XState': everything it does
@@ -590,6 +605,7 @@ addWindow :: Runtime -> Connection -> ObjectId -> IO ()
 addWindow rt conn win = do
   node <- riverWindowV1GetNode conn win
   let ref = rtWindows rt
+  dbg rt ("window announced: object " ++ show win)
   modifyIORef' ref $ M.insert win RiverWindow
     { rwObject = win, rwNode = node
     , rwAppId = Nothing, rwTitle = Nothing, rwPid = Nothing
@@ -599,9 +615,14 @@ addWindow rt conn win = do
     , rwNew = True, rwClosed = False, rwFullscreen = False, rwHidden = False
     }
   riverWindowV1Listen conn win $ \case
-    RiverWindowV1Closed        -> adjust ref win $ \w -> w { rwClosed = True }
+    RiverWindowV1Closed        -> do
+      dbg rt ("window closed event: object " ++ show win)
+      adjust ref win $ \w -> w { rwClosed = True }
     RiverWindowV1AppId a       -> adjust ref win $ \w -> w { rwAppId = a }
-    RiverWindowV1Title t       -> adjust ref win $ \w -> w { rwTitle = t }
+    RiverWindowV1Title t       -> do
+      dbg rt ("window title: object " ++ show win ++ " "
+              ++ show (fmap utf8ToString t))
+      adjust ref win $ \w -> w { rwTitle = t }
     RiverWindowV1UnreliablePid p -> adjust ref win $ \w -> w { rwPid = Just p }
     RiverWindowV1Identifier i  -> adjust ref win $ \w -> w { rwIdentifier = Just i }
     RiverWindowV1Parent p      -> adjust ref win $ \w ->
@@ -777,6 +798,9 @@ addSeat rt conn seat = do
 
 manageSequence :: Runtime -> X ()
 manageSequence rt = do
+  start <- io getCurrentTime
+  dbgOn <- asks (riverDebug . riverState)
+  riverDebugLine dbgOn "seq: start"
   asks (inManageSeq . riverState) >>= \r -> io (writeIORef r True)
   restoreState rt
   reapClosed
@@ -787,6 +811,8 @@ manageSequence rt = do
   runPending rt
   applyLayout rt
   asks (inManageSeq . riverState) >>= \r -> io (writeIORef r False)
+  end <- io getCurrentTime
+  riverDebugLine dbgOn ("seq: done in " ++ show (diffUTCTime end start))
 
 -- | Pick up where the previous window manager left off, if it left a state
 -- file.
@@ -859,6 +885,9 @@ reapClosed :: X ()
 reapClosed = do
   ref <- asks (riverWindows . riverState)
   ws <- io (readIORef ref)
+  let closed = [ rwObject w | w <- M.elems ws, rwClosed w ]
+  asks (riverDebug . riverState) >>= \d ->
+    riverDebugLine d ("reapClosed: " ++ show closed)
   forM_ [ w | w <- M.elems ws, rwClosed w ] $ \w ->
     modify $ \st -> st { windowset = W.delete (rwObject w) (windowset st) }
 
@@ -881,6 +910,8 @@ reapObjects :: Runtime -> Connection -> IO ()
 reapObjects rt conn = do
   let ref = rtWindows rt
   ws <- readIORef ref
+  dbg rt ("reapObjects: destroying "
+          ++ show [ rwObject w | w <- M.elems ws, rwClosed w ])
   forM_ [ w | w <- M.elems ws, rwClosed w ] $ \w -> do
     forgetBorderOverride (rwObject w)
     riverNodeV1Destroy conn (rwNode w)
@@ -1027,6 +1058,9 @@ adoptNewWindows = do
   ref <- asks (riverWindows . riverState)
   ws <- io (readIORef ref)
   let fresh = [ w | w <- M.elems ws, rwNew w, not (rwClosed w) ]
+  asks (riverDebug . riverState) >>= \d ->
+    riverDebugLine d ("adopt: " ++ show (length fresh) ++ " fresh of "
+                      ++ show (M.size ws) ++ " known")
   forM_ fresh $ \w -> do
     io $ adjust ref (rwObject w) $ \x -> x { rwNew = False }
     -- Ask for server-side decoration before the manage hook runs, so a config

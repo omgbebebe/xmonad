@@ -56,7 +56,7 @@ import XMonad.Core
 import XMonad.Layout (ChangeLayout(..))
 import XMonad.Operations (float, sendMessage, windows)
 import XMonad.River (afterLayout, moveResizeWindow, postAction, restackWindows)
-import XMonad.River.State (RiverState(..))
+import XMonad.River.State (RiverState(..), riverDebugLine)
 import XMonad.River.Types (RiverWindow(..), Rectangle(..), utf8ToString, stringToUtf8)
 import qualified XMonad.StackSet as W
 
@@ -367,6 +367,10 @@ applySurfaces s = do
         | (appId, (rect, o)) <- M.toList surfaces
         , Just rw <- [lookupSurface appId]
         ]
+  asks (riverDebug . riverState) >>= \d -> riverDebugLine d
+    ("applySurfaces: want=" ++ show (M.size surfaces)
+     ++ " placed=" ++ show (length placed)
+     ++ " knownLive=" ++ show (M.size known))
   case (M.keys surfaces, placed) of
     ([], _) -> return ()
     (want, []) -> do

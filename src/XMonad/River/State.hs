@@ -23,11 +23,14 @@
 --
 -----------------------------------------------------------------------------
 
-module XMonad.River.State (RiverState(..), InputCapture(..), updatePlacement) where
+module XMonad.River.State (RiverState(..), InputCapture(..), updatePlacement, riverDebugLine) where
 
+import Control.Monad (when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.IORef (IORef, modifyIORef')
+import Data.Time.Clock (getCurrentTime)
 import qualified Data.Map as M
+import System.IO (hPutStrLn, stderr)
 
 import XMonad.River.Mailbox (Mailbox)
 import XMonad.River.Types (KeyMask, KeySym, Position, Rectangle, RiverOutput, RiverSeat, RiverWindow, Window)
@@ -149,7 +152,22 @@ data RiverState m = RiverState
       -- same code reads the geometry from before its own change.  This is
       -- where an action that needs the answer waits for it.  See
       -- 'XMonad.River.afterLayout'.
+    , riverDebug :: !Bool
+      -- ^ The XMONAD_RIVER_DEBUG env var, read once at startup. Gates
+      -- 'riverDebugLine': timestamped lifecycle logs used to hunt
+      -- adoption stalls (a panel restart that the window map does
+      -- not pick up for minutes). Nothing reads it on the hot path
+      -- beyond an if.
     }
+
+-- | Timestamped stderr line, gated by the 'riverDebug' flag. The
+-- adoption-stall hunt this exists for only reproduces under a live
+-- session, so every line carries its own timestamp rather than
+-- relying on the log's ordering alone.
+riverDebugLine :: MonadIO m => Bool -> String -> m ()
+riverDebugLine on msg = when on $ do
+  now <- liftIO getCurrentTime
+  liftIO $ hPutStrLn stderr ("xmonad-river: dbg: " ++ show now ++ " " ++ msg)
 
 -- | Correct the recorded geometry of a window that something has just moved or
 -- resized outside a layout run.
