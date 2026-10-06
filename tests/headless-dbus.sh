@@ -99,6 +99,17 @@ timeout $((DURATION + 20)) dbus-run-session -- sh -c '
           >> "$RT/calls.log" 2>&1
       sleep 8
   fi
+  # Layout round trip: SetLayoutGroup(1) then NextLayout (2 layouts
+  # configured, so it rotates back to 0). Headless river has no
+  # keyboards, so the river-side request no-ops; what this proves is
+  # the dbus channel — group tracked, LayoutChanged emitted, rotation
+  # math. The xkb effect itself needs the live session.
+  busctl --user call org.xmonad.WM /org/xmonad/WM org.xmonad.WM \
+      SetLayoutGroup i 1 >> "$RT/calls.log" 2>&1
+  sleep 1
+  busctl --user call org.xmonad.WM /org/xmonad/WM org.xmonad.WM \
+      NextLayout >> "$RT/calls.log" 2>&1
+  sleep 1
   kill "$MON_PID" "$RIVER_PID" 2>/dev/null
   wait "$RIVER_PID" 2>/dev/null
 '
@@ -163,6 +174,26 @@ if [ -s "$CALLS" ] && grep -qi 'error' "$CALLS"; then
     head -5 "$CALLS" >&2
 else
     report "SwitchWorkspace calls returned cleanly" ok
+fi
+
+# Layout round trip: SetLayoutGroup(1) must produce a LayoutChanged
+# naming group 1, and NextLayout (2 layouts) must rotate back to 0 in
+# the LAST LayoutChanged.  Body lines look like:
+#   INT32 1;
+#   ARRAY "s" ...
+if grep -A4 'Member=LayoutChanged' "$MON" | grep -q 'INT32 1;'; then
+    report "SetLayoutGroup(1) emitted LayoutChanged group=1" ok
+else
+    report "SetLayoutGroup(1) emitted LayoutChanged group=1" no
+fi
+
+LAST_LAYOUT=$(grep -n 'Member=LayoutChanged' "$MON" | tail -1 | cut -d: -f1)
+if [ -n "$LAST_LAYOUT" ]; then
+    if sed -n "${LAST_LAYOUT},$((LAST_LAYOUT + 5))p" "$MON" | grep -q 'INT32 0;'; then
+        report "NextLayout rotated the group back to 0" ok
+    else
+        report "NextLayout rotated the group back to 0" no
+    fi
 fi
 
 # the assertion that matters for panels: the titled client was

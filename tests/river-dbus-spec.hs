@@ -11,4 +11,5 @@ main :: IO ()
 main = xmonad def
   { workspaces = ["alpha", "beta", "gamma"]
   , startupHook = dbusService defaultDBusConfig
+      { dcLayouts = ["us", "ru"] }
   }

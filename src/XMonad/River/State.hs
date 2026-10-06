@@ -152,6 +152,13 @@ data RiverState m = RiverState
       -- same code reads the geometry from before its own change.  This is
       -- where an action that needs the answer waits for it.  See
       -- 'XMonad.River.afterLayout'.
+    , riverLayoutHook :: !(IORef (Maybe (Int -> IO ())))
+      -- ^ Who hears about an xkb layout group change river reports through
+      -- @river_xkb_keyboard_v1.layout@ (a different xkb-config client
+      -- switching, a keymap option toggling). Set by
+      -- "XMonad.River.DBus" so the panel's indicator follows; the window
+      -- manager's own SetLayoutGroup needs no hook — it tracks the group
+      -- it asked for itself.
     , riverDebug :: !Bool
       -- ^ The XMONAD_RIVER_DEBUG env var, read once at startup. Gates
       -- 'riverDebugLine': timestamped lifecycle logs used to hunt

@@ -118,6 +118,7 @@ library
                    XMonad.River.Protocol.VirtualKeyboard
                    XMonad.River.Protocol.WindowManagement
                    XMonad.River.Protocol.XkbBindings
+                   XMonad.River.Protocol.XkbConfig
                    XMonad.River.Types
                    XMonad.River.Wire
                    XMonad.River.Xkb

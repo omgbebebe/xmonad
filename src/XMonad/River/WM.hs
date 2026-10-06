@@ -71,6 +71,7 @@ import XMonad.River.Protocol.WindowManagement
 import XMonad.River.Protocol.Core
 import XMonad.River.Protocol.LayerShell
 import XMonad.River.Protocol.XkbBindings
+import XMonad.River.Protocol.XkbConfig
 import XMonad.River.Wire (ObjectId, isNullObject)
 import XMonad.River.Types
 import XMonad.River.Plan
@@ -158,6 +159,20 @@ data Runtime = Runtime
     -- ^ The XMONAD_RIVER_DEBUG env var, read once at startup; see
     -- 'XMonad.River.State.riverDebugLine'. The Runtime copy serves
     -- the event loop, which has no 'XConf'.
+  , rtXkbConfig :: !(Maybe ObjectId)
+    -- ^ The @river_xkb_config_v1@ global, when the compositor offers it.
+    -- Without it there is no way to set an xkb layout group and
+    -- 'OpSetLayoutGroup' applies to nothing.
+  , rtXkbKeyboards :: !(IORef (S.Set ObjectId))
+    -- ^ Every @river_xkb_keyboard_v1@ the compositor has announced. A
+    -- group set is broadcast to all of them.
+  , rtLayoutGroup :: !(IORef Int)
+    -- ^ The last layout group known to be active. Written before a group
+    -- set is sent and on @layout@ events, so a keyboard that appears
+    -- later starts in the current group rather than 0.
+  , rtLayoutHook :: !(IORef (Maybe (Int -> IO ())))
+    -- ^ The same ref as 'riverLayoutHook' in the 'RiverState'; the
+    -- event loop fires it on group changes it did not ask for.
   }
 
 --------------------------------------------------------------------------------
@@ -187,6 +202,13 @@ riverMain userConfig dirs = do
   mCompositor <- bindGlobal conn registry globals
                    wlCompositorInterface 4 wlCompositorVersion
   mShm <- bindGlobal conn registry globals wlShmInterface 1 wlShmVersion
+  -- Optional. This is the input-config counterpart of the window management
+  -- global: river_xkb_keyboard_v1.set_layout_by_index is how a panel's
+  -- NextLayout actually reaches the keymap. Nothing else in the session
+  -- changes layout groups, so without it Caps-as-Hyper has nothing to
+  -- switch.
+  mXkbConfig <- bindGlobal conn registry globals
+                  riverXkbConfigV1Interface 1 riverXkbConfigV1Version
 
   case (mManager, mBindings) of
     (Just (manager, _), Just (bindings, bindingsVer)) -> do
@@ -200,7 +222,8 @@ riverMain userConfig dirs = do
         "xmonad-river: river_xkb_bindings_v1 is version 1; submaps cannot \
         \detect an unbound key and will wait for one of their own"
       run conn manager bindings bindingsVer (fmap fst mLayerShell)
-          (fmap fst mCompositor) (fmap fst mShm) userConfig dirs
+          (fmap fst mCompositor) (fmap fst mShm) (fmap fst mXkbConfig)
+          userConfig dirs
     _ -> do
       hPutStrLn stderr
         "xmonad-river: river_window_manager_v1 (>= 4) or \
@@ -208,9 +231,10 @@ riverMain userConfig dirs = do
       exitFailure
 
 run :: Connection -> ObjectId -> ObjectId -> Word32 -> Maybe ObjectId
-    -> Maybe ObjectId -> Maybe ObjectId -> XConfig Layout
+    -> Maybe ObjectId -> Maybe ObjectId -> Maybe ObjectId -> XConfig Layout
     -> Directories -> IO ()
-run conn manager bindings bindingsVer layerShell compositor shm userConfig dirs = do
+run conn manager bindings bindingsVer layerShell compositor shm xkbConfig
+    userConfig dirs = do
   windowsRef <- newIORef M.empty
   outputsRef <- newIORef M.empty
   seatsRef   <- newIORef M.empty
@@ -228,6 +252,9 @@ run conn manager bindings bindingsVer layerShell compositor shm userConfig dirs 
   restackRef  <- newIORef []
   extraKeysRef <- newIORef []
   afterLayoutRef <- newIORef []
+  xkbKeyboardsRef <- newIORef S.empty
+  layoutGroupRef <- newIORef 0
+  layoutHookRef <- newIORef Nothing
   rt <- Runtime
           <$> newIORef []
           <*> pure bindingsRef
@@ -253,6 +280,10 @@ run conn manager bindings bindingsVer layerShell compositor shm userConfig dirs 
           <*> pure layerShell
           <*> newIORef Nothing
           <*> pure debug
+          <*> pure xkbConfig
+          <*> pure xkbKeyboardsRef
+          <*> pure layoutGroupRef
+          <*> pure layoutHookRef
 
   when (null (workspaces userConfig)) $ hPutStrLn stderr
     "xmonad-river: the config has no workspaces; using a single one named \"1\""
@@ -300,6 +331,7 @@ run conn manager bindings bindingsVer layerShell compositor shm userConfig dirs 
             , riverCapture = submapRef
             , riverDragOrigin = dragOrigin
             , riverAfterLayout = afterLayoutRef
+            , riverLayoutHook = layoutHookRef
             , riverDebug = debug
             }
         , normalBorder = parseColor (normalBorderColor userConfig)
@@ -353,6 +385,11 @@ run conn manager bindings bindingsVer layerShell compositor shm userConfig dirs 
   riverWindowManagerV1Listen conn manager $
     onManagerEvent conn manager restartRef rt submit tick
 
+  forM_ (rtXkbConfig rt) $ \cfg ->
+    riverXkbConfigV1Listen conn cfg $ \case
+      RiverXkbConfigV1XkbKeyboard kbd -> addXkbKeyboard conn rt kbd
+      _ -> pure ()
+
   riverWindowManagerV1ManageDirty conn manager
 
   setMainThread
@@ -403,6 +440,7 @@ run conn manager bindings bindingsVer layerShell compositor shm userConfig dirs 
           OpStop -> riverWindowManagerV1Stop conn manager
           OpSetXcursorTheme s name size -> when (M.member s seatsNow) $
             riverSeatV1SetXcursorTheme conn s name size
+          OpSetLayoutGroup g -> applyLayoutGroup conn rt g
           _ -> pure ()
         -- Flush before waiting, or a request queued but not yet written --
         -- the manage_dirty just above, on the very first pass -- never
@@ -594,6 +632,47 @@ broadcastEvent ev = do
 -- 'XMonad.River.State.riverDebugLine' for what the flag is.
 dbg :: Runtime -> String -> IO ()
 dbg rt = riverDebugLine (rtDebug rt)
+
+-- | Take note of an xkb keyboard river has announced, and bring it in
+-- line with the current layout group — a keyboard that appears after
+-- the group was chosen starts in group 0, which would leave one
+-- keyboard typing Russian while another types English.
+--
+-- Runs on the event loop in 'IO', like the other object tracking here.
+addXkbKeyboard :: Connection -> Runtime -> ObjectId -> IO ()
+addXkbKeyboard conn rt kbd = do
+  modifyIORef' (rtXkbKeyboards rt) (S.insert kbd)
+  riverXkbKeyboardV1Listen conn kbd $ \case
+    RiverXkbKeyboardV1Layout idx _ -> onLayoutGroup rt (fromIntegral idx)
+    RiverXkbKeyboardV1Removed -> do
+      modifyIORef' (rtXkbKeyboards rt) (S.delete kbd)
+      riverXkbKeyboardV1Destroy conn kbd
+    _ -> pure ()
+  g <- readIORef (rtLayoutGroup rt)
+  riverXkbKeyboardV1SetLayoutByIndex conn kbd (fromIntegral g)
+  dbg rt ("xkb keyboard " ++ show kbd ++ " announced, group set to " ++ show g)
+
+-- | A group change river reports through @river_xkb_keyboard_v1.layout@.
+-- One @layout@ event arrives per keyboard, so the change check is what
+-- keeps the hook to a single call.
+onLayoutGroup :: Runtime -> Int -> IO ()
+onLayoutGroup rt g = do
+  old <- readIORef (rtLayoutGroup rt)
+  when (g /= old) $ do
+    writeIORef (rtLayoutGroup rt) g
+    dbg rt ("layout group changed externally: " ++ show old ++ " -> " ++ show g)
+    readIORef (rtLayoutHook rt) >>= mapM_ ($ g)
+
+-- | Send @set_layout_by_index@ to every known xkb keyboard. Input
+-- config, not window management state — river accepts it outside a
+-- manage sequence, so this drains with the now-ops.
+applyLayoutGroup :: Connection -> Runtime -> Int -> IO ()
+applyLayoutGroup conn rt g = do
+  writeIORef (rtLayoutGroup rt) g
+  kbds <- readIORef (rtXkbKeyboards rt)
+  forM_ kbds $ \kbd ->
+    riverXkbKeyboardV1SetLayoutByIndex conn kbd (fromIntegral g)
+  dbg rt ("layout group set to " ++ show g ++ " on " ++ show (S.size kbds) ++ " keyboard(s)")
 
 -- | Take note of a window river has just told us about.
 --

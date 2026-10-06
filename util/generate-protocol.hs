@@ -44,6 +44,8 @@ sources =
     , river "protocol/river-window-management-v1.xml" )
   , ( "river-xkb-bindings-v1.xml"
     , river "protocol/river-xkb-bindings-v1.xml" )
+  , ( "river-xkb-config-v1.xml"
+    , river "protocol/river-xkb-config-v1.xml" )
   , ( "river-layer-shell-v1.xml"
     , river "protocol/river-layer-shell-v1.xml" )
   , ( "wlr-layer-shell-unstable-v1.xml"
@@ -74,6 +76,7 @@ targets :: [(FilePath, String, Maybe [String])]
 targets =
   [ ("river-window-management-v1.xml", "XMonad.River.Protocol.WindowManagement", Nothing)
   , ("river-xkb-bindings-v1.xml",      "XMonad.River.Protocol.XkbBindings", Nothing)
+  , ("river-xkb-config-v1.xml",        "XMonad.River.Protocol.XkbConfig", Nothing)
   , ("river-layer-shell-v1.xml",       "XMonad.River.Protocol.LayerShell", Nothing)
   , ("wayland.xml",                    "XMonad.River.Protocol.Core",
       Just [ "wl_compositor", "wl_shm", "wl_shm_pool", "wl_surface"

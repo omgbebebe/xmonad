@@ -56,14 +56,18 @@ import XMonad.Core
 import XMonad.Layout (ChangeLayout(..))
 import XMonad.Operations (float, sendMessage, windows)
 import XMonad.River (afterLayout, moveResizeWindow, postAction, restackWindows)
+import XMonad.River.Plan (Op(..))
+import XMonad.River.Runtime (emitNow)
 import XMonad.River.State (RiverState(..), riverDebugLine)
 import XMonad.River.Types (RiverWindow(..), Rectangle(..), utf8ToString, stringToUtf8)
 import qualified XMonad.StackSet as W
 
--- | Knobs on the service.  @dcSetGroup@ is deliberately not defaulted
--- to anything clever: which backend applies an xkb layout group is a
--- session policy (riverctl keyboard-layout, a patched compositor, a
--- virtual keymap), and a silent wrong guess is worse than a log line.
+-- | Knobs on the service. @dcSetGroup@ defaults to the river request:
+-- the window manager is itself a river client, and
+-- @river_xkb_keyboard_v1.set_layout_by_index@ is how a layout group
+-- reaches the keymap (see @OpSetLayoutGroup@ in "XMonad.River.WM",
+-- which broadcasts it to every known keyboard). A config that wants a
+-- different policy can still override it.
 data DBusConfig = DBusConfig
   { dcBusName :: String
     -- ^ well-known name to own; default @org.xmonad.WM@
@@ -71,16 +75,15 @@ data DBusConfig = DBusConfig
     -- ^ layout rotation list reported in LayoutChanged, in group
     -- order; default empty (no layout reporting)
   , dcSetGroup :: Int -> IO ()
-    -- ^ apply a layout group; default logs and does nothing
+    -- ^ apply a layout group; default sends the river xkb-config
+    -- request through the event loop
   }
 
 defaultDBusConfig :: DBusConfig
 defaultDBusConfig = DBusConfig
   { dcBusName = "org.xmonad.WM"
   , dcLayouts = []
-  , dcSetGroup = \n -> hPutStrLn stderr
-      ("xmonad-river: dbus: SetLayoutGroup requested but no backend \
-       \configured (DBusConfig dcSetGroup); group was " ++ show n)
+  , dcSetGroup = emitNow . OpSetLayoutGroup
   }
 
 data Svc = Svc
@@ -147,6 +150,11 @@ dbusService cfg = do
   focusRef <- liftIO (newIORef Nothing)
   let s = Svc conf sigs snapRef surfRef appliedRef stackedRef warnedRef
             groupRef (dcLayouts cfg) focusRef
+  -- Adopt group changes river reports through river_xkb_keyboard_v1
+  -- (another xkb-config client switching, a keymap option toggling) so
+  -- the panel's indicator follows them. Our own SetLayoutGroup needs
+  -- no hook — setGroup tracks what it asked for.
+  liftIO $ writeIORef (riverLayoutHook (riverState conf)) (Just (externalGroupChange s))
   liftIO $ do
     void $ forkIO (dbusThread cfg s)
     -- 1s fallback emission: title and app_id changes arrive outside
@@ -318,7 +326,21 @@ setGroup :: DBusConfig -> Svc -> Int -> IO ()
 setGroup cfg s g = do
   writeIORef (sGroup s) g
   dcSetGroup cfg g
-  writeChan (sSignals s) (SigLayout (g, sLayouts s))
+  -- Through the snapshot emitter, not a direct signal: emitSignals is
+  -- what updates the diff baseline, so signalling here AND leaving the
+  -- baseline stale makes the next fallback emission repeat the signal.
+  postAction (sXConf s) (emitSignals s)
+
+-- | A layout group change river reported rather than one we asked for.
+-- Adopt it into the tracked group so the next snapshot and the
+-- indicator agree with reality, without re-sending the request (that
+-- would ping-pong: request -> layout event -> request ...).
+externalGroupChange :: Svc -> Int -> IO ()
+externalGroupChange s g = do
+  old <- readIORef (sGroup s)
+  when (g /= old) $ do
+    writeIORef (sGroup s) g
+    postAction (sXConf s) (emitSignals s)
 
 -- | Place (or move) a client's surface: float the window at the
 -- rectangle and keep every placed surface stacked by its stackOrder,

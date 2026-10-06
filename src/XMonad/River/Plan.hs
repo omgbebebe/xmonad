@@ -121,6 +121,11 @@ data Op
     -- manager so a successor may connect.
   | OpSetXcursorTheme !ObjectId !ByteString !Word32
     -- ^ The cursor theme and size, on one seat.
+  | OpSetLayoutGroup !Int
+    -- ^ @river_xkb_keyboard_v1.set_layout_by_index@ on every known xkb
+    -- keyboard — the layout group half of the panel's NextLayout. Input
+    -- config rather than window management state, so it drains with the
+    -- now-ops, outside any sequence.
   | OpGrabKeys ![(KeyMask, KeySym)]
     -- ^ Bind these for as long as the config wants them, reporting presses and
     -- releases by index.  Unlike 'OpCaptureInput' this disables nothing and
