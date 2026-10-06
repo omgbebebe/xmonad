@@ -105,6 +105,7 @@ library
                    XMonad.River.Keyboard
                    XMonad.River.Keysym
                    XMonad.River.Keysym.Table
+                   XMonad.River.Keysym.XF86
                    XMonad.River.Mailbox
                    XMonad.River.Plan
                    XMonad.River.Runtime
